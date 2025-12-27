@@ -16,21 +16,30 @@ def toy_repo(tmp_path: Path) -> Path:
     repo_dir = tmp_path / "toy"
     repo_dir.mkdir()
     subprocess.run(["git", "init"], cwd=repo_dir, check=True)
+    filler = "\n".join(["x" * 40 for _ in range(20)])
     (repo_dir / "module.py").write_text(
-        """
+        f"""
 import os
 from . import helper
 
 def first():
-    \"\"\"First function.\"\"\"
+    \"\"\"First function.
+{filler}
+    \"\"\"
     return 1
 
 
 def second():
+    \"\"\"Second function.
+{filler}
+    \"\"\"
     return 2
 
 
 class Example:
+    \"\"\"Example class.
+{filler}
+    \"\"\"
     def method(self):
         return 3
 """.lstrip(),

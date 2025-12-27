@@ -9,9 +9,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, Optional
 
+from ingest.chunking import chunk_text
 from ingest.constants import DEFAULT_IGNORE_PATTERNS, LANGUAGE_BY_EXTENSION
 from ingest.ignore import filter_ignored_dirs, should_ignore
-from ingest.python_ast import extract_imports, extract_units
+from ingest.python_ast import extract_imports
 
 logger = logging.getLogger(__name__)
 
@@ -83,36 +84,6 @@ def _language_for_path(path: Path) -> str:
     return LANGUAGE_BY_EXTENSION.get(path.suffix.lower(), "unknown")
 
 
-def _chunk_text(path: Path, text: str, max_lines: int = 200, overlap: int = 20) -> Iterable[dict]:
-    lines = text.splitlines()
-    if not lines:
-        return []
-    units = []
-    start = 0
-    while start < len(lines):
-        end = min(start + max_lines, len(lines))
-        chunk_lines = lines[start:end]
-        start_line = start + 1
-        end_line = end
-        unit_id = f"{path}:{start_line}-{end_line}"
-        units.append(
-            {
-                "unit_id": unit_id,
-                "path": str(path),
-                "start_line": start_line,
-                "end_line": end_line,
-                "kind": "chunk",
-                "symbol": None,
-                "signature": None,
-                "text": "\n".join(chunk_lines),
-            }
-        )
-        if end == len(lines):
-            break
-        start = end - overlap
-    return units
-
-
 def index_repo(repo_dir: Path, ignore_patterns: Optional[Iterable[str]] = None) -> Path:
     """Index a local repo into JSONL manifests, units, and import graph."""
     repo_dir = repo_dir.resolve()
@@ -174,18 +145,14 @@ def index_repo(repo_dir: Path, ignore_patterns: Optional[Iterable[str]] = None) 
                 if not is_text or text is None:
                     continue
 
+                for unit in chunk_text(rel_path, text):
+                    units_handle.write(json.dumps(unit) + "\n")
+                    unit_count += 1
+
                 if file_path.suffix.lower() == ".py":
-                    units = extract_units(rel_path, text)
-                    for unit in units:
-                        units_handle.write(json.dumps(asdict(unit)) + "\n")
-                        unit_count += 1
                     for imp in extract_imports(rel_path, text, repo_dir):
                         imports_handle.write(json.dumps(asdict(imp)) + "\n")
                         import_count += 1
-                else:
-                    for unit in _chunk_text(rel_path, text):
-                        units_handle.write(json.dumps(unit) + "\n")
-                        unit_count += 1
 
     print(f"Indexed {file_count} files")
     print(f"Wrote {unit_count} units and {import_count} import records")
