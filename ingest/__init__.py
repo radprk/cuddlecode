@@ -1,6 +1,5 @@
-"""Ingestion tools for building local repo indexes."""
+"""Repository ingestion utilities."""
 
-from ingest.clone import clone_repo
-from ingest.indexer import index_repo
+from .cli import main
 
-__all__ = ["clone_repo", "index_repo"]
+__all__ = ["main"]

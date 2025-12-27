@@ -1,66 +1,45 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import os
-import subprocess
-from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Sequence
 
-from ingest.chunking import chunk_text
-from ingest.constants import DEFAULT_IGNORE_PATTERNS, LANGUAGE_BY_EXTENSION
-from ingest.ignore import filter_ignored_dirs, should_ignore
-from ingest.python_ast import extract_imports
+from .chunking import chunk_python_file, chunk_text_file
+from .ignore import IgnoreSpec
+from .imports import build_imports
+from .models import FileRecord, ImportRecord, IndexResult, UnitRecord
+from .utils import sha256_file
 
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
-
-class RepoIndexError(RuntimeError):
-    pass
-
-
-def _git_head_sha(repo_dir: Path) -> str:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RepoIndexError("Unable to resolve HEAD SHA") from exc
-    return result.stdout.strip()
-
-
-def _git_remote_name(repo_dir: Path) -> Optional[str]:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_dir), "config", "--get", "remote.origin.url"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError:
-        return None
-    url = result.stdout.strip()
-    if not url:
-        return None
-    if url.startswith("git@"):  # git@github.com:user/repo.git
-        path = url.split(":", 1)[-1]
-    else:
-        path = url.rstrip("/")
-        if "://" in path:
-            path = path.split("://", 1)[-1]
-        path = path.split("/", 1)[-1]
-    name = Path(path).name
-    if name.endswith(".git"):
-        name = name[: -len(".git")]
-    return name
+LANGUAGE_BY_SUFFIX = {
+    ".py": "Python",
+    ".js": "JavaScript",
+    ".ts": "TypeScript",
+    ".jsx": "JavaScript",
+    ".tsx": "TypeScript",
+    ".md": "Markdown",
+    ".json": "JSON",
+    ".yml": "YAML",
+    ".yaml": "YAML",
+    ".toml": "TOML",
+    ".rs": "Rust",
+    ".go": "Go",
+    ".java": "Java",
+    ".kt": "Kotlin",
+    ".c": "C",
+    ".h": "C",
+    ".cpp": "C++",
+    ".hpp": "C++",
+}
 
 
-def _is_text_file(path: Path) -> bool:
+def detect_language(path: Path) -> str | None:
+    return LANGUAGE_BY_SUFFIX.get(path.suffix.lower())
+
+
+def is_text_file(path: Path) -> bool:
     try:
         data = path.read_bytes()
     except OSError:
@@ -74,86 +53,113 @@ def _is_text_file(path: Path) -> bool:
     return True
 
 
-def _sha256_bytes(data: bytes) -> str:
-    digest = hashlib.sha256()
-    digest.update(data)
-    return digest.hexdigest()
+def iter_repo_files(repo_root: Path, ignore: IgnoreSpec) -> Iterator[Path]:
+    for path in repo_root.rglob("*"):
+        rel_path = path.relative_to(repo_root)
+        if ignore.should_skip(rel_path):
+            if path.is_dir():
+                LOGGER.debug("Skipping directory %s", rel_path)
+            continue
+        if path.is_file():
+            yield path
 
 
-def _language_for_path(path: Path) -> str:
-    return LANGUAGE_BY_EXTENSION.get(path.suffix.lower(), "unknown")
+def create_manifest_record(path: Path, repo_root: Path) -> FileRecord:
+    rel_path = path.relative_to(repo_root)
+    is_text = is_text_file(path)
+    n_lines: int | None
+    if is_text:
+        try:
+            n_lines = len(path.read_text(encoding="utf-8").splitlines())
+        except OSError:
+            n_lines = None
+    else:
+        n_lines = None
+    record = FileRecord(
+        path=rel_path.as_posix(),
+        abs_path=str(path.resolve()),
+        size_bytes=path.stat().st_size,
+        sha256=sha256_file(path),
+        language=detect_language(path),
+        is_text=is_text,
+        n_lines=n_lines,
+    )
+    return record
 
 
-def index_repo(repo_dir: Path, ignore_patterns: Optional[Iterable[str]] = None) -> Path:
-    """Index a local repo into JSONL manifests, units, and import graph."""
-    repo_dir = repo_dir.resolve()
-    if ignore_patterns is None:
-        ignore_patterns = DEFAULT_IGNORE_PATTERNS
+def write_jsonl(path: Path, records: Iterable[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False))
+            handle.write("\n")
 
-    repo_name = _git_remote_name(repo_dir) or repo_dir.name
-    commit_sha = _git_head_sha(repo_dir)
-    output_dir = Path("indexes") / repo_name / commit_sha
-    output_dir.mkdir(parents=True, exist_ok=True)
-    files_path = output_dir / "files.jsonl"
+
+def index_repo(
+    repo_root: Path,
+    output_root: Path,
+    ignore: IgnoreSpec | None = None,
+) -> IndexResult:
+    ignore_spec = ignore or IgnoreSpec()
+    repo_root = repo_root.resolve()
+    repo_name = repo_root.parent.name
+    commit_sha = repo_root.name
+    output_dir = output_root / repo_name / commit_sha
+    manifest_path = output_dir / "files.jsonl"
     units_path = output_dir / "units.jsonl"
     imports_path = output_dir / "imports.jsonl"
 
-    logger.info("Indexing repo %s at %s", repo_name, repo_dir)
-    print(f"Indexing repo at: {repo_dir}")
-    print(f"Writing index files to: {output_dir}")
+    LOGGER.info("Indexing repo %s at %s", repo_name, repo_root)
 
-    file_count = 0
-    unit_count = 0
-    import_count = 0
+    file_records: list[FileRecord] = []
+    units: list[UnitRecord] = []
+    imports: list[ImportRecord] = []
 
-    with files_path.open("w", encoding="utf-8") as files_handle, units_path.open(
-        "w", encoding="utf-8"
-    ) as units_handle, imports_path.open("w", encoding="utf-8") as imports_handle:
-        for root, dirs, files in os.walk(repo_dir):
-            dirs[:] = filter_ignored_dirs(dirs, ignore_patterns)
-            root_path = Path(root)
-            for filename in files:
-                file_path = root_path / filename
-                rel_path = file_path.relative_to(repo_dir)
-                if should_ignore(file_path, ignore_patterns):
-                    continue
-                # Read file bytes once to compute hash and decide if it's text.
-                try:
-                    data = file_path.read_bytes()
-                except OSError:
-                    logger.warning("Failed to read %s", file_path)
-                    continue
-                size_bytes = file_path.stat().st_size
-                is_text = _is_text_file(file_path)
-                text = None
-                n_lines = 0
-                if is_text:
-                    text = data.decode("utf-8")
-                    n_lines = len(text.splitlines())
-                record = {
-                    "path": str(rel_path),
-                    "abs_path": str(file_path),
-                    "size_bytes": size_bytes,
-                    "sha256": _sha256_bytes(data),
-                    "language": _language_for_path(file_path),
-                    "is_text": is_text,
-                    "n_lines": n_lines,
-                }
-                files_handle.write(json.dumps(record) + "\n")
-                file_count += 1
+    for file_path in iter_repo_files(repo_root, ignore_spec):
+        record = create_manifest_record(file_path, repo_root)
+        file_records.append(record)
+        if record.is_text:
+            language = record.language
+            text = file_path.read_text(encoding="utf-8")
+            if language == "Python":
+                units.extend(
+                    chunk_python_file(
+                        text=text,
+                        path=record.path,
+                    )
+                )
+                imports.extend(
+                    build_imports(
+                        text=text,
+                        path=record.path,
+                        repo_root=repo_root,
+                    )
+                )
+            else:
+                units.extend(
+                    chunk_text_file(
+                        text=text,
+                        path=record.path,
+                    )
+                )
 
-                if not is_text or text is None:
-                    continue
+    write_jsonl(manifest_path, [record.__dict__ for record in file_records])
+    write_jsonl(units_path, [record.__dict__ for record in units])
+    write_jsonl(imports_path, [record.__dict__ for record in imports])
 
-                for unit in chunk_text(rel_path, text):
-                    units_handle.write(json.dumps(unit) + "\n")
-                    unit_count += 1
+    return IndexResult(
+        repo_name=repo_name,
+        commit_sha=commit_sha,
+        manifest_path=manifest_path,
+        units_path=units_path,
+        imports_path=imports_path,
+    )
 
-                if file_path.suffix.lower() == ".py":
-                    for imp in extract_imports(rel_path, text, repo_dir):
-                        imports_handle.write(json.dumps(asdict(imp)) + "\n")
-                        import_count += 1
 
-    print(f"Indexed {file_count} files")
-    print(f"Wrote {unit_count} units and {import_count} import records")
-    return output_dir
+def index_repo_dir(
+    repo_dir: str,
+    output_root: str = "./indexes",
+    ignore: Sequence[str] | None = None,
+) -> IndexResult:
+    ignore_spec = IgnoreSpec.from_iterable(ignore)
+    return index_repo(Path(repo_dir), Path(output_root), ignore_spec)

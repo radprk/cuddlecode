@@ -82,38 +82,6 @@ def extract_units(path: Path, text: str) -> list[PythonUnit]:
     return sorted(units, key=lambda unit: unit.start_line)
 
 
-def extract_top_level_units(path: Path, text: str) -> list[PythonUnit]:
-    """Extract top-level function/class units from Python source."""
-    tree = ast.parse(text)
-    units: list[PythonUnit] = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if not hasattr(node, "lineno") or not hasattr(node, "end_lineno"):
-                continue
-            start_line = int(node.lineno)
-            end_line = int(node.end_lineno)
-            source = ast.get_source_segment(text, node)
-            if source is None:
-                lines = text.splitlines()
-                source = "\n".join(lines[start_line - 1 : end_line])
-            signature = _function_signature(node)
-            unit_id = f"{path}:{start_line}-{end_line}:{node.name}"
-            kind = "class" if isinstance(node, ast.ClassDef) else "function"
-            units.append(
-                PythonUnit(
-                    unit_id=unit_id,
-                    path=str(path),
-                    start_line=start_line,
-                    end_line=end_line,
-                    kind=kind,
-                    symbol=node.name,
-                    signature=signature,
-                    text=source,
-                )
-            )
-    return sorted(units, key=lambda unit: unit.start_line)
-
-
 def _resolve_module(module: str, repo_root: Path, src_path: Path, level: int) -> Optional[str]:
     """Best-effort resolver for intra-repo Python imports."""
     if level > 0:
